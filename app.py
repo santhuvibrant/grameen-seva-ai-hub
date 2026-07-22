@@ -690,7 +690,8 @@ st.markdown('<div class="mic-help">I will detect your language and ask one quest
 
 mic_col_left, mic_col_center, mic_col_right = st.columns([1, 2, 1])
 with mic_col_center:
-    audio = st.audio_input("Microphone", sample_rate=16000, key="kiosk_mic")
+    # Streamlit 1.45+ defaults this widget to 16 kHz.
+    audio = st.audio_input("Microphone", key="kiosk_mic")
 
 conversation: ConversationState = st.session_state.conversation
 if conversation.turns:
@@ -750,7 +751,6 @@ with col_left:
     st.markdown('<div class="control-box">', unsafe_allow_html=True)
     audio = st.audio_input(
         "Tap Mic & Speak / बोलने के लिए दबाएं",
-        sample_rate=16000,
         key="kiosk_mic",
     )
     st.markdown("</div>", unsafe_allow_html=True)
