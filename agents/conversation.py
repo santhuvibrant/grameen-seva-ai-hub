@@ -1,42 +1,33 @@
-"""Two-phase Gemini conversation agent: collect first, research second."""
+"""Single-agent conversational orchestration for the kiosk."""
 
 from __future__ import annotations
 
 import json
 import re
+import time
+from functools import lru_cache
 from typing import Any
 
 from google import genai
 from google.genai import types
 
-from agents.prompts import EXTRACTION_PROMPT, RESEARCH_PROMPT
+from agents.prompts import CONVERSATION_PROMPT
 from models.conversation import AgentResult, ConversationState
 from services.research import get_scheme_details, search_schemes
 
 
-MODEL_PREFERENCES = (
-    # Keep the kiosk's routine turns on the lower-cost 2.0 Flash-Lite model.
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    # Fallbacks keep deployments working when a key has not enabled 2.0.
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-)
+# This is the only Gemini model used by the application. Keep it explicit so
+# quota configuration cannot silently select an obsolete lower-cost model.
+GEMINI_MODEL = "gemini-2.5-flash"
+MAX_GEMINI_RETRIES = 3
 
 
-def _available_model(client: Any) -> str:
-    """Choose a current Flash model enabled for this specific API key."""
-    available = {
-        str(getattr(model, "name", "")).removeprefix("models/")
-        for model in client.models.list()
-    }
-    for preferred in MODEL_PREFERENCES:
-        if preferred in available:
-            return preferred
-    raise RuntimeError(
-        "No supported Gemini Flash model is enabled for this API key. "
-        "Enable a current Gemini Flash model in Google AI Studio."
-    )
+@lru_cache(maxsize=1)
+def _gemini_client(api_key: str) -> Any:
+    """Create exactly one cached Gemini client for the Streamlit process."""
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing from Streamlit secrets")
+    return genai.Client(api_key=api_key)
 
 
 def _parse(text: str) -> dict[str, Any]:
@@ -53,15 +44,15 @@ def _parse(text: str) -> dict[str, Any]:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
-    return {"voice_response": cleaned[:500], "next_question": "", "conversation_complete": False}
+    return {
+        "conversation_complete": False,
+        "voice_response": cleaned[:500] or "Please tell me what farming support you need.",
+        "next_question": "",
+    }
 
 
 def _history(state: ConversationState) -> str:
-    # Assistant questions are already represented by the structured result.
-    # Do not let them be mistaken for things the farmer actually said.
-    return "\n".join(
-        f"farmer: {turn['text']}" for turn in state.turns if turn["role"] == "farmer"
-    )
+    return "\n".join(f"{turn['role']}: {turn['text']}" for turn in state.turns)
 
 
 def _tool_declarations() -> list[types.Tool]:
@@ -69,7 +60,7 @@ def _tool_declarations() -> list[types.Tool]:
         types.Tool(function_declarations=[
             types.FunctionDeclaration(
                 name="search_schemes",
-                description="Search official Indian government agricultural schemes.",
+                description="Search official Indian government agricultural schemes. Call at most once, and only after the conversation has enough farmer details.",
                 parameters=types.Schema(
                     type="OBJECT",
                     properties={
@@ -81,7 +72,7 @@ def _tool_declarations() -> list[types.Tool]:
             ),
             types.FunctionDeclaration(
                 name="get_scheme_details",
-                description="Read an official scheme page.",
+                description="Read exactly one selected official scheme page after search returns an official URL.",
                 parameters=types.Schema(
                     type="OBJECT",
                     properties={"url": types.Schema(type="STRING")},
@@ -92,57 +83,111 @@ def _tool_declarations() -> list[types.Tool]:
     ]
 
 
+def _retryable(exc: Exception) -> bool:
+    text = str(exc).upper()
+    return any(token in text for token in (
+        "RESOURCE_EXHAUSTED",
+        "429",
+        "UNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "INTERNAL",
+        "TIMEOUT",
+    ))
+
+
+def _generate_with_retry(client: Any, contents: list[types.Content], system: str, tools: list[types.Tool]) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(MAX_GEMINI_RETRIES):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    tools=tools,
+                    temperature=0.2,
+                ),
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _retryable(exc) or attempt == MAX_GEMINI_RETRIES - 1:
+                raise
+            time.sleep(2 ** attempt)
+    raise last_error or RuntimeError("Gemini request failed")
+
+
 def _run_tool(name: str, args: dict[str, Any], state: ConversationState, keys: dict[str, str]) -> str:
     if name == "search_schemes":
-        return search_schemes(args.get("query", ""), args.get("state", ""), keys["tavily"])
+        if state.research_search_done:
+            return state.research_context or json.dumps({"results": []})
+        state.set_state("SEARCHING")
+        state.research_search_done = True
+        state.research_context = search_schemes(args.get("query", ""), args.get("state", ""), keys["tavily"])
+        try:
+            payload = json.loads(state.research_context)
+            state.official_urls = [str(item.get("url", "")) for item in payload.get("results", []) if item.get("url")]
+        except (TypeError, ValueError):
+            state.official_urls = []
+        return state.research_context
+
     if name == "get_scheme_details":
-        return get_scheme_details(args.get("url", ""), keys["firecrawl"])
+        url = str(args.get("url", ""))
+        if not state.research_search_done or state.researched_url or url not in state.official_urls:
+            return state.research_context or json.dumps({"error": "No new official URL is available"})
+        state.researched_url = url
+        state.set_state("SEARCHING")
+        return get_scheme_details(url, keys["firecrawl"])
+
     return json.dumps({"error": "Unknown tool"})
 
 
-def _generate(client: Any, model: str, prompt: str, system: str, tools: list[types.Tool] | None = None) -> str:
-    response = client.models.generate_content(
-        model=model,
-        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-        config=types.GenerateContentConfig(system_instruction=system, tools=tools or []),
-    )
-    return response.text or ""
-
-
 def run_conversation(state: ConversationState, gemini_key: str, tavily_key: str, firecrawl_key: str) -> AgentResult:
-    client = genai.Client(api_key=gemini_key)
-    model = _available_model(client)
+    """Run one conversational turn without crashing on transient Gemini failures."""
+    client = _gemini_client(gemini_key)
     detected = state.language_code or "unknown"
-    extraction = _parse(_generate(
-        client,
-        model,
-        f"Detected language: {detected}\nConversation:\n{_history(state)}",
-        EXTRACTION_PROMPT,
-    ))
-    preliminary = AgentResult.from_dict(extraction, detected)
-    if not preliminary.conversation_complete:
-        return preliminary
+    prompt = (
+        f"Detected language: {detected}\n"
+        f"Conversation history:\n{_history(state)}\n"
+        "Process the latest farmer utterance. If details are missing, ask exactly one follow-up question and do not use tools. "
+        "If enough details exist, call search_schemes once, then read one selected official URL with get_scheme_details."
+    )
+    contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=prompt)])]
 
-    contents: list[types.Content] = [types.Content(role="user", parts=[types.Part(text=(
-        f"Detected language: {detected}\nCollected farmer information:\n{_history(state)}\n"
-        "Research the best matching official scheme and return the required JSON."
-    ))])]
-    for _ in range(8):
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=RESEARCH_PROMPT, tools=_tool_declarations()),
+    try:
+        for _ in range(6):
+            response = _generate_with_retry(client, contents, CONVERSATION_PROMPT, _tool_declarations())
+            candidate = response.candidates[0] if response.candidates else None
+            parts = candidate.content.parts if candidate and candidate.content else []
+            calls = [part.function_call for part in parts if part.function_call]
+            if not calls:
+                result = AgentResult.from_dict(_parse(response.text or ""), detected)
+                state.farmer_profile.update({
+                    "language": result.language or detected,
+                    "state": result.state,
+                    "district": result.district,
+                    "land_size": result.land_size,
+                    "farmer_category": result.farmer_category,
+                    "equipment_or_input": result.equipment_or_input,
+                    "missing_criteria": result.missing_criteria,
+                })
+                state.documents_collected = result.required_documents
+                state.eligibility_status = "complete" if result.conversation_complete else "collecting"
+                return result
+
+            contents.append(candidate.content)
+            responses = []
+            for call in calls:
+                responses.append(types.Part(function_response=types.FunctionResponse(
+                    name=call.name,
+                    response={"result": _run_tool(call.name, dict(call.args or {}), state, {"tavily": tavily_key, "firecrawl": firecrawl_key})},
+                )))
+            contents.append(types.Content(role="user", parts=responses))
+    except Exception as exc:
+        return AgentResult(
+            language=detected,
+            conversation_complete=False,
+            voice_response="I am having a temporary connection problem. Please wait a moment and speak again.",
+            missing_criteria=["temporary assistant connection problem"],
         )
-        candidate = response.candidates[0]
-        parts = candidate.content.parts if candidate.content else []
-        calls = [part.function_call for part in parts if part.function_call]
-        if not calls:
-            result = AgentResult.from_dict(_parse(response.text or ""), detected)
-            result.conversation_complete = True
-            return result
-        contents.append(candidate.content)
-        contents.append(types.Content(role="user", parts=[types.Part(function_response=types.FunctionResponse(
-            name=call.name,
-            response={"result": _run_tool(call.name, dict(call.args or {}), state, {"tavily": tavily_key, "firecrawl": firecrawl_key})},
-        )) for call in calls]))
-    return AgentResult(language=detected, conversation_complete=True, voice_response="I could not complete the official source lookup.")
+
+    return AgentResult(language=detected, voice_response="I need one more detail before I continue.")

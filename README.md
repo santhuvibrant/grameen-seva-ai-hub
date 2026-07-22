@@ -8,9 +8,9 @@
 
 | Feature | Technology |
 |---------|------------|
-| Voice input | Streamlit `st.audio_input` (browser mic) |
+| Voice input | Autonomous browser recorder with ~2 second silence detection |
 | Speech-to-Text | Sarvam AI `saaras:v3` |
-| AI Agent | Google Gemini 2.5 Flash + function calling |
+| AI Agent | Google Gemini 2.5 Flash + function calling, one cached client |
 | Web search | Tavily API (`myscheme.gov.in`, `gov.in`) |
 | Page reading | Firecrawl API |
 | Text-to-Speech | Sarvam AI `bulbul:v3` |
@@ -152,13 +152,13 @@ DEPLOY_URL = "https://YOUR-APP-NAME.streamlit.app"
 ## Architecture
 
 ```
-Farmer speaks → st.audio_input (WAV, 16 kHz)
+Farmer taps once → browser microphone + automatic silence detection and resume
        ↓
 Sarvam STT (saaras:v3) → transcript
        ↓
-Gemini 2.5 Flash
-  ├── search_schemes()   → Tavily (myscheme.gov.in / gov.in)
-  └── get_scheme_details() → Firecrawl (markdown)
+Gemini 2.5 Flash → conversation state and one follow-up question
+       ↓ (only when complete)
+Tavily → one official URL → Firecrawl → one selected official page
        ↓
 Structured JSON → Metric cards (%, ₹ max claim, scheme name)
        ↓

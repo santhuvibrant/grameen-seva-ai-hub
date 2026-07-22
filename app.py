@@ -15,11 +15,10 @@ from typing import Any
 
 import qrcode
 import streamlit as st
-from google import genai
 from google.genai import types
-
-from agents.conversation import run_conversation
+from agents.conversation import GEMINI_MODEL, run_conversation
 from models.conversation import ConversationState
+from services.recorder import autonomous_recorder
 from services.sarvam import text_to_speech, transcribe
 
 # ---------------------------------------------------------------------------
@@ -46,6 +45,8 @@ for key, default in {
     "tts_audio_bytes": None,
     "last_audio_hash": None,
     "replay_counter": 0,
+    "tts_token": 0,
+    "last_component_event_id": None,
     "conversation": ConversationState(),
 }.items():
     st.session_state.setdefault(key, default)
@@ -429,7 +430,11 @@ def sarvam_client(api_key: str):
 
 @st.cache_resource
 def gemini_client(api_key: str):
-    return genai.Client(api_key=api_key)
+    # Legacy compatibility wrapper. The active agent owns the single cached
+    # Gemini client; this function never constructs another one.
+    from agents.conversation import _gemini_client
+
+    return _gemini_client(api_key)
 
 
 @st.cache_resource
@@ -597,7 +602,7 @@ def run_agent(transcript: str, state: str, category: str, language_code: str) ->
 
     for _ in range(8):
         response = client.models.generate_content(
-        model="gemini-2.0-flash-lite",
+            model=GEMINI_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -651,34 +656,13 @@ def format_inr(amount: int | float) -> str:
 
 
 def automatic_recording() -> bytes | None:
-    """Record one utterance and return it after browser-side silence detection.
-
-    The primary component returns a base64 payload. The fallback component
-    returns raw audio bytes and stops after a pause, so the cloud deployment
-    remains usable if the primary component is unavailable.
-    """
-    try:
-        from streamlit_realtime_audio_recorder import audio_recorder
-    except ModuleNotFoundError:
-        try:
-            from audio_recorder_streamlit import audio_recorder
-        except ModuleNotFoundError:
-            st.error(
-                "The microphone component is not installed. Redeploy after installing "
-                "the dependencies from requirements.txt."
-            )
-            return None
-        return audio_recorder(pause_threshold=1.5, sample_rate=16000) or None
-
-    recording = audio_recorder(interval=50, threshold=-55, silenceTimeout=1500)
-    if not recording or recording.get("status") != "stopped":
-        return None
-    encoded = recording.get("audioData")
-    return base64.b64decode(encoded) if encoded else None
+    """Backward-compatible no-op; active UI uses autonomous_recorder."""
+    return None
 
 
 def process_recording(audio_bytes: bytes) -> bool:
     conversation: ConversationState = st.session_state.conversation
+    conversation.set_state("PROCESSING")
     work = st.status("Working on your request…", expanded=True)
     work.write("✅ Recording received")
     work.write("🎧 Converting your voice into text…")
@@ -687,6 +671,7 @@ def process_recording(audio_bytes: bytes) -> bool:
             transcript, detected_language = transcribe(audio_bytes, get_secret("SARVAM_API_KEY"))
         except Exception as exc:
             st.session_state.card_status = "error"
+            conversation.set_state("LISTENING")
             work.update(label="Speech recognition failed", state="error", expanded=True)
             st.error(f"Speech recognition failed: {exc}")
             return False
@@ -694,11 +679,13 @@ def process_recording(audio_bytes: bytes) -> bool:
 
     if not transcript:
         st.session_state.card_status = "error"
+        conversation.set_state("LISTENING")
         work.update(label="I could not hear the recording", state="error", expanded=True)
         st.error("I could not hear the recording. Please speak closer to the microphone and try again.")
         return False
 
     conversation.transcript = transcript
+    conversation.set_state("THINKING")
     if detected_language:
         conversation.language_code = detected_language
     conversation.add_turn("farmer", transcript)
@@ -714,10 +701,13 @@ def process_recording(audio_bytes: bytes) -> bool:
             )
         except Exception as exc:
             st.session_state.card_status = "error"
+            conversation.set_state("LISTENING")
             work.update(label="The assistant could not process the request", state="error", expanded=True)
             st.error(f"Assistant request failed: {exc}")
             return False
     conversation.result = result
+    if result.goodbye_detected:
+        result.conversation_complete = True
     # The text shown and the text spoken must always be identical.
     spoken_response = result.voice_response or result.next_question
     if result.next_question and result.next_question not in spoken_response:
@@ -732,6 +722,7 @@ def process_recording(audio_bytes: bytes) -> bool:
     st.session_state.missing_criteria = ", ".join(result.missing_criteria)
     st.session_state.voice_response = spoken_response
     st.session_state.card_status = "success" if result.conversation_complete else "warning"
+    conversation.set_state("SPEAKING")
 
     if result.conversation_complete:
         work.write("🔎 Enough information collected. Searching official government sources…")
@@ -747,12 +738,15 @@ def process_recording(audio_bytes: bytes) -> bool:
                 conversation.language_code or "hi-IN",
                 get_secret("SARVAM_API_KEY"),
             )
+            st.session_state.tts_token += 1
         except Exception as exc:
             st.session_state.tts_audio_bytes = None
+            conversation.set_state("LISTENING")
             work.update(label="Reply text is ready, but voice playback failed", state="error", expanded=True)
             st.error(f"TTS failed: {exc}")
             return False
 
+    conversation.set_state("DISPLAY_RESULTS" if result.conversation_complete else "LISTENING")
     work.update(label="Reply ready — see the conversation below", state="complete", expanded=False)
     return True
 
@@ -781,6 +775,13 @@ def render_metrics() -> None:
         cards.append(f'<div class="metric-card"><div class="metric-label">Eligible Scheme</div><div class="metric-value" style="font-size:1.5rem;">{html.escape(st.session_state.scheme_name)}</div></div>')
     if cards:
         st.markdown(f'<div class="metric-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+    documents = result.required_documents
+    if documents:
+        items = "".join(f"<li>{html.escape(document)}</li>" for document in documents)
+        st.markdown(
+            f'<div class="documents-box"><strong>Required documents</strong><ul>{items}</ul></div>',
+            unsafe_allow_html=True,
+        )
     return
     if st.session_state.scheme_name:
         st.markdown(
@@ -850,18 +851,33 @@ if missing:
 # Conversation-first kiosk home screen
 # ---------------------------------------------------------------------------
 
-st.markdown('<div class="mic-heading">Tap the microphone and speak naturally</div>', unsafe_allow_html=True)
-st.markdown('<div class="mic-help">I will detect your language and ask one question at a time.</div>', unsafe_allow_html=True)
+conversation: ConversationState = st.session_state.conversation
+state_labels = {
+    "IDLE": "🎙️ Tap once to begin",
+    "LISTENING": "🎤 Listening",
+    "PROCESSING": "📝 Understanding",
+    "THINKING": "🤖 Thinking",
+    "SPEAKING": "🔊 Speaking",
+    "SEARCHING": "🔍 Searching official schemes",
+    "DISPLAY_RESULTS": "📄 Preparing response",
+    "COMPLETED": "✅ Conversation complete",
+}
+st.markdown('<div class="mic-heading">Grameen Seva AI Hub</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="mic-help">{state_labels.get(conversation.state, conversation.state)}</div>',
+    unsafe_allow_html=True,
+)
 
 mic_col_left, mic_col_center, mic_col_right = st.columns([1, 2, 1])
 with mic_col_center:
-    st.markdown(
-        '<div class="mic-stage" aria-label="Animated microphone"><div class="mic-orb"><span>🎙️</span></div></div>',
-        unsafe_allow_html=True,
+    audio = autonomous_recorder(
+        active=conversation.state != "COMPLETED",
+        auto_start=conversation.listening_started and conversation.state == "LISTENING",
+        tts_audio=(st.session_state.tts_audio_bytes if conversation.state != "COMPLETED" else None),
+        tts_token=st.session_state.tts_token,
+        resume_after_tts=not conversation.result.conversation_complete,
     )
-    audio = automatic_recording()
 
-conversation: ConversationState = st.session_state.conversation
 if not conversation.turns:
     st.markdown(
         '<div class="status-message">🎙️ Tap once and speak. I will listen, understand, and reply automatically.</div>',
@@ -884,7 +900,6 @@ if conversation.result.conversation_complete:
     render_metrics()
     if st.session_state.tts_audio_bytes:
         st.markdown("##### 🔊 Listen to the answer")
-        st.audio(st.session_state.tts_audio_bytes, format="audio/wav", autoplay=True)
         if st.button("🔊 Replay answer", use_container_width=True):
             st.session_state.replay_counter += 1
             st.audio(
@@ -894,16 +909,33 @@ if conversation.result.conversation_complete:
                 key=f"replay_{st.session_state.replay_counter}",
             )
 
-if audio is not None:
-    if isinstance(audio, (bytes, bytearray)):
-        audio_bytes = bytes(audio)
-    elif hasattr(audio, "getvalue"):
-        audio_bytes = audio.getvalue()
-    else:
-        audio_bytes = None
-    if not audio_bytes:
-        st.warning("I could not read that recording. Please try the microphone once more.")
+if isinstance(audio, dict):
+    event = audio.get("event")
+    event_id = audio.get("id")
+    fresh_event = event_id != st.session_state.last_component_event_id
+    if fresh_event and event_id is not None:
+        st.session_state.last_component_event_id = event_id
+    if not fresh_event:
+        event = None
+    if event == "listening":
+        conversation.listening_started = True
+        conversation.set_state("LISTENING")
+    if event == "completed":
+        conversation.set_state("COMPLETED")
+        st.rerun()
+    if event == "error":
+        st.error("Microphone permission is required to start the conversation.")
+        conversation.set_state("IDLE")
+        conversation.listening_started = False
         st.stop()
+    audio_payload = audio.get("audio", "")
+    audio_bytes = base64.b64decode(audio_payload) if audio_payload else None
+elif audio is not None:
+    audio_bytes = bytes(audio) if isinstance(audio, (bytes, bytearray)) else audio.getvalue()
+else:
+    audio_bytes = None
+
+if audio_bytes:
     audio_hash = hash(audio_bytes)
     if audio_hash != st.session_state.last_audio_hash:
         if process_recording(audio_bytes):

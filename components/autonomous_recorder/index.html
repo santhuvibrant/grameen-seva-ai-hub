@@ -1,0 +1,141 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body { margin: 0; background: transparent; font-family: sans-serif; }
+    #root { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 220px; gap: 10px; }
+    button {
+      width: 170px; height: 170px; border: 0; border-radius: 50%; cursor: pointer;
+      color: white; background: radial-gradient(circle at 35% 25%, #66bb6a, #2e7d32 68%, #1b5e20);
+      font-size: 4.5rem; line-height: 1; font-weight: 800;
+      box-shadow: 0 0 0 12px rgba(165,214,167,.34), 0 12px 30px rgba(46,125,50,.32);
+      animation: breathe 1.8s ease-in-out infinite;
+    }
+    button:hover { background: #1b5e20; }
+    .hint { color: #546e7a; font-size: 14px; font-weight: 700; }
+    .orb { width: 170px; height: 170px; display: grid; place-items: center; border-radius: 50%; color: white; background: radial-gradient(circle at 35% 25%, #66bb6a, #2e7d32 68%, #1b5e20); font-size: 4.5rem; box-shadow: 0 0 0 12px rgba(165,214,167,.34), 0 12px 30px rgba(46,125,50,.32); }
+    .live { animation: breathe 1.1s ease-in-out infinite, glow 2s ease-out infinite; }
+    @keyframes breathe { 0%,100% { transform: scale(.98); } 50% { transform: scale(1.03); } }
+    @keyframes glow { 0% { box-shadow: 0 0 0 10px rgba(165,214,167,.4), 0 0 0 10px rgba(46,125,50,.25); } 100% { box-shadow: 0 0 0 30px rgba(165,214,167,0), 0 0 0 50px rgba(46,125,50,0); } }
+  </style>
+</head>
+<body>
+  <div id="root"><button id="start">Tap once to start</button></div>
+  <script>
+    const root = document.getElementById("root");
+    const startButton = document.getElementById("start");
+    let args = {};
+    let stream = null;
+    let recorder = null;
+    let analyser = null;
+    let raf = null;
+    let chunks = [];
+    let speaking = false;
+    let silenceSince = 0;
+    let started = false;
+    let lastTtsToken = -1;
+    let audioElement = null;
+
+    function send(value) {
+      window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:setComponentValue", value}, "*");
+    }
+    function setHeight() {
+      window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 230}, "*");
+    }
+    function show(text) {
+      root.innerHTML = "<div class='orb live'>🎙️</div><span class='hint'>" + text + "</span>";
+      setHeight();
+    }
+    function encode(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      const step = 0x8000;
+      for (let i = 0; i < bytes.length; i += step) binary += String.fromCharCode(...bytes.subarray(i, i + step));
+      return btoa(binary);
+    }
+    function stopTracks() {
+      if (raf) cancelAnimationFrame(raf);
+      raf = null;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      recorder = null;
+      analyser = null;
+      speaking = false;
+      silenceSince = 0;
+    }
+    async function beginListening() {
+      if (!args.active || stream) return;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        const context = new AudioContext();
+        const source = context.createMediaStreamSource(stream);
+        analyser = context.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        chunks = [];
+        recorder = new MediaRecorder(stream);
+        recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+        recorder.onstop = async () => {
+          const blob = new Blob(chunks, {type: recorder.mimeType || "audio/webm"});
+          const buffer = await blob.arrayBuffer();
+          stopTracks();
+          if (blob.size > 1000) send({event: "audio", audio: encode(buffer), id: Date.now()});
+          else if (args.active) beginListening();
+        };
+        recorder.start();
+        started = true;
+        send({event: "listening", id: Date.now()});
+        show("🎤 Listening — speak naturally");
+        monitor();
+      } catch (error) {
+        show("Microphone permission is required");
+        send({event: "error", message: String(error)});
+      }
+    }
+    function monitor() {
+      if (!analyser || !recorder || recorder.state !== "recording") return;
+      const data = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (const value of data) { const n = (value - 128) / 128; sum += n * n; }
+      const rms = Math.sqrt(sum / data.length);
+      const now = performance.now();
+      if (rms > 0.025) { speaking = true; silenceSince = 0; }
+      else if (speaking) {
+        if (!silenceSince) silenceSince = now;
+        if (now - silenceSince >= 2000) { recorder.stop(); return; }
+      }
+      raf = requestAnimationFrame(monitor);
+    }
+    function playTts(audioBase64, token) {
+      if (!audioBase64 || token === lastTtsToken) return Promise.resolve();
+      lastTtsToken = token;
+      stopTracks();
+      return new Promise(resolve => {
+        audioElement = new Audio("data:audio/wav;base64," + audioBase64);
+        audioElement.onended = () => {
+          audioElement = null; resolve();
+          if (args.resume_after_tts && args.active) beginListening();
+          else if (!args.resume_after_tts) { show("Conversation complete"); send({event: "completed", id: Date.now()}); }
+        };
+        audioElement.onerror = () => { audioElement = null; resolve(); if (args.resume_after_tts && args.active) beginListening(); };
+        audioElement.play().catch(() => { resolve(); if (args.resume_after_tts && args.active) beginListening(); });
+      });
+    }
+    function render(newArgs) {
+      args = newArgs || {};
+      setHeight();
+      if (!args.active && !args.tts_audio) { stopTracks(); show("Conversation complete"); return; }
+      if (args.tts_audio && args.tts_token !== lastTtsToken) { playTts(args.tts_audio, args.tts_token); return; }
+      if (args.auto_start && !stream && !audioElement) beginListening();
+      else if (!started) { root.innerHTML = "<button id='start'>🎙️</button><span class='hint'>Tap once to start</span>"; document.getElementById("start").onclick = beginListening; }
+    }
+    window.addEventListener("message", event => {
+      if (event.data && event.data.type === "streamlit:render") render(event.data.args);
+    });
+    window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1}, "*");
+    setHeight();
+  </script>
+</body>
+</html>
