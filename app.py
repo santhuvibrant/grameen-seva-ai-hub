@@ -789,10 +789,14 @@ if audio is not None:
     audio_bytes = audio.getvalue()
     audio_hash = hash(audio_bytes)
     if audio_hash != st.session_state.last_audio_hash:
-        st.session_state.last_audio_hash = audio_hash
-        st.info("✅ Recording received. I’m listening and preparing your reply…")
-        process_recording(audio_bytes)
-        st.rerun()
+        st.markdown(
+            '<div class="status-message">✅ Your recording is ready. Press the button below to get your answer.</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("✅ Get my answer", use_container_width=True, key="submit_recording"):
+            st.session_state.last_audio_hash = audio_hash
+            process_recording(audio_bytes)
+            st.rerun()
 
 # The legacy layout below is retained in source only while this migration is staged.
 # It is unreachable so no old controls or duplicate dashboard are rendered.
