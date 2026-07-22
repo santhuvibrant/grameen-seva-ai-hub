@@ -592,7 +592,7 @@ def format_inr(amount: int | float) -> str:
     return f"₹{','.join(parts + [last3])}"
 
 
-def process_recording(audio_bytes: bytes) -> None:
+def process_recording(audio_bytes: bytes) -> bool:
     conversation: ConversationState = st.session_state.conversation
     work = st.status("Working on your request…", expanded=True)
     work.write("✅ Recording received")
@@ -604,14 +604,14 @@ def process_recording(audio_bytes: bytes) -> None:
             st.session_state.card_status = "error"
             work.update(label="Speech recognition failed", state="error", expanded=True)
             st.error(f"Speech recognition failed: {exc}")
-            return
+            return False
         st.session_state.transcript = transcript
 
     if not transcript:
         st.session_state.card_status = "error"
         work.update(label="I could not hear the recording", state="error", expanded=True)
         st.error("I could not hear the recording. Please speak closer to the microphone and try again.")
-        return
+        return False
 
     conversation.transcript = transcript
     if detected_language:
@@ -631,7 +631,7 @@ def process_recording(audio_bytes: bytes) -> None:
             st.session_state.card_status = "error"
             work.update(label="The assistant could not process the request", state="error", expanded=True)
             st.error(f"Assistant request failed: {exc}")
-            return
+            return False
     conversation.result = result
     if result.next_question:
         conversation.add_turn("assistant", result.next_question)
@@ -664,9 +664,10 @@ def process_recording(audio_bytes: bytes) -> None:
             st.session_state.tts_audio_bytes = None
             work.update(label="Reply text is ready, but voice playback failed", state="error", expanded=True)
             st.error(f"TTS failed: {exc}")
-            return
+            return False
 
     work.update(label="Reply ready — see the conversation below", state="complete", expanded=False)
+    return True
 
 
 def render_metrics() -> None:
@@ -794,9 +795,9 @@ if audio is not None:
             unsafe_allow_html=True,
         )
         if st.button("✅ Get my answer", use_container_width=True, key="submit_recording"):
-            st.session_state.last_audio_hash = audio_hash
-            process_recording(audio_bytes)
-            st.rerun()
+            if process_recording(audio_bytes):
+                st.session_state.last_audio_hash = audio_hash
+                st.rerun()
 
 # The legacy layout below is retained in source only while this migration is staged.
 # It is unreachable so no old controls or duplicate dashboard are rendered.
