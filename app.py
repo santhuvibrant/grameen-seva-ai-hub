@@ -105,6 +105,61 @@ st.markdown(
         font-size: 1.15rem;
         margin: 0.75rem 0 1.5rem;
     }
+    .mic-stage {
+        position: relative;
+        width: 230px;
+        height: 230px;
+        margin: 1.25rem auto 0.5rem;
+        display: grid;
+        place-items: center;
+    }
+    .mic-stage::before,
+    .mic-stage::after {
+        content: "";
+        position: absolute;
+        inset: 8px;
+        border: 3px solid rgba(46, 125, 50, 0.28);
+        border-radius: 50%;
+        animation: mic-pulse 2.2s ease-out infinite;
+    }
+    .mic-stage::after {
+        animation-delay: 1.1s;
+    }
+    .mic-orb {
+        position: relative;
+        z-index: 1;
+        width: 150px;
+        height: 150px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        color: #FFFFFF;
+        background: radial-gradient(circle at 35% 25%, #66BB6A, #2E7D32 68%, #1B5E20);
+        box-shadow: 0 12px 30px rgba(46, 125, 50, 0.32), 0 0 0 12px rgba(165, 214, 167, 0.34);
+        animation: mic-breathe 1.8s ease-in-out infinite;
+        font-size: 4.5rem;
+        line-height: 1;
+    }
+    .mic-orb span {
+        transform: translateY(-2px);
+        filter: drop-shadow(0 2px 2px rgba(0,0,0,0.18));
+    }
+    @keyframes mic-pulse {
+        0% { transform: scale(0.72); opacity: 0.85; }
+        75%, 100% { transform: scale(1.08); opacity: 0; }
+    }
+    @keyframes mic-breathe {
+        0%, 100% { transform: scale(0.98); }
+        50% { transform: scale(1.03); }
+    }
+    div[data-testid="stCustomComponentV1"] {
+        max-width: 260px;
+        min-height: 58px;
+        margin: -2.5rem auto 1rem;
+        position: relative;
+        z-index: 2;
+        text-align: center;
+    }
     .status-message {
         max-width: 30rem;
         margin: 0.75rem auto;
@@ -800,6 +855,10 @@ st.markdown('<div class="mic-help">I will detect your language and ask one quest
 
 mic_col_left, mic_col_center, mic_col_right = st.columns([1, 2, 1])
 with mic_col_center:
+    st.markdown(
+        '<div class="mic-stage" aria-label="Animated microphone"><div class="mic-orb"><span>🎙️</span></div></div>',
+        unsafe_allow_html=True,
+    )
     audio = automatic_recording()
 
 conversation: ConversationState = st.session_state.conversation
@@ -836,7 +895,15 @@ if conversation.result.conversation_complete:
             )
 
 if audio is not None:
-    audio_bytes = audio.getvalue()
+    if isinstance(audio, (bytes, bytearray)):
+        audio_bytes = bytes(audio)
+    elif hasattr(audio, "getvalue"):
+        audio_bytes = audio.getvalue()
+    else:
+        audio_bytes = None
+    if not audio_bytes:
+        st.warning("I could not read that recording. Please try the microphone once more.")
+        st.stop()
     audio_hash = hash(audio_bytes)
     if audio_hash != st.session_state.last_audio_hash:
         if process_recording(audio_bytes):
@@ -908,7 +975,7 @@ with col_right:
 
 # Process new audio outside columns to avoid duplicate reruns
 if audio is not None:
-    audio_bytes = audio.getvalue()
+    audio_bytes = bytes(audio) if isinstance(audio, (bytes, bytearray)) else audio.getvalue()
     audio_hash = hash(audio_bytes)
     if audio_hash != st.session_state.last_audio_hash:
         st.session_state.last_audio_hash = audio_hash
