@@ -20,7 +20,6 @@ def transcribe(audio_bytes: bytes, api_key: str) -> tuple[str, str]:
     result = _client(api_key).speech_to_text.transcribe(
         file=io.BytesIO(audio_bytes),
         model="saaras:v3",
-        mode="transcribe",
         language_code="unknown",
     )
     transcript = str(getattr(result, "transcript", "") or "").strip()

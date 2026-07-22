@@ -403,7 +403,6 @@ def legacy_transcribe(audio_bytes: bytes, language_code: str) -> str:
     result = client.speech_to_text.transcribe(
         file=buffer,
         model="saaras:v3",
-        mode="transcribe",
         language_code=language_code,
     )
     return (result.transcript or "").strip()
