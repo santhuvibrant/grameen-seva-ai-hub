@@ -1,18 +1,22 @@
 import streamlit as st
 import time
 import logging
-import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted, RetryError, DeadlineExceeded
+from google import genai
+from google.genai.errors import APIError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------
-# GEMINI CONFIGURATION
+# GEMINI CONFIGURATION (google-genai SDK v1.25+)
 # ---------------------------------------------------------
 GEMINI_KEY = st.secrets.get("gemini_api_key") or st.secrets.get("GEMINI_API_KEY")
+ai_client = None
 if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+    try:
+        ai_client = genai.Client(api_key=GEMINI_KEY)
+    except Exception as e:
+        st.error(f"Failed to initialize Gemini Client: {e}")
 else:
     st.error("Configuration Error: Gemini API Key missing from Streamlit secrets.")
 
@@ -138,21 +142,8 @@ def init_state():
         st.session_state.tts_audio_b64 = None
 
 # ---------------------------------------------------------
-# SAFE GEMINI EXECUTION & GOV SEARCH PIPELINE
+# GOV SEARCH PIPELINE WITH GEMINI SUMMARIZATION
 # ---------------------------------------------------------
-def safe_gemini_call(func, *args, **kwargs):
-    """Executes functions calling Gemini with backoff handling."""
-    for attempt in range(3):
-        try:
-            return func(*args, **kwargs)
-        except (ResourceExhausted, RetryError, DeadlineExceeded) as e:
-            logging.warning(f"Gemini API attempt {attempt+1} retry: {e}")
-            time.sleep(1.5 * (attempt + 1))
-        except Exception as e:
-            logging.error(f"Gemini API Execution Exception: {e}")
-            break
-    return None
-
 def run_gov_search_pipeline(state: ConversationState) -> str:
     """Executes Tavily search restricted to official government domains, scrapes via Firecrawl, and summarizes."""
     district = state.district or ""
@@ -168,8 +159,7 @@ def run_gov_search_pipeline(state: ConversationState) -> str:
             official_url = search_results["results"][0].get("url")
             if official_url and ("gov.in" in official_url):
                 page_text = firecrawl_scrape(official_url)
-                if page_text:
-                    model = genai.GenerativeModel("gemini-1.5-flash")
+                if page_text and ai_client:
                     prompt = f"""
                     You are assisting an Indian farmer. Summarize the government subsidy scheme details clearly and concisely.
                     Rely strictly on the provided web content. Do NOT invent eligibility or amounts.
@@ -178,9 +168,17 @@ def run_gov_search_pipeline(state: ConversationState) -> str:
                     Scraped Web Content:
                     {page_text[:4000]}
                     """
-                    res = safe_gemini_call(model.generate_content, prompt)
-                    if res and res.text:
-                        return res.text
+                    for attempt in range(3):
+                        try:
+                            res = ai_client.models.generate_content(
+                                model="gemini-1.5-flash",
+                                contents=prompt
+                            )
+                            if res and res.text:
+                                return res.text
+                        except APIError as e:
+                            logging.warning(f"Gemini API attempt {attempt+1} retry: {e}")
+                            time.sleep(1.5 * (attempt + 1))
     except Exception as e:
         logging.error(f"Search pipeline error: {e}")
         
@@ -213,7 +211,7 @@ def main():
             "ta-IN": "தமிழ் (Tamil)",
             "kn-IN": "ಕನ್ನಡ (Kannada)",
             "ml-IN": "മലയാളം (Malayalam)",
-            "mr-IN": "मराठी (Marathi)",
+            "mr-IN": "మరాठी (Marathi)",
             "bn-IN": "বাংলা (Bengali)",
             "gu-IN": "ગુજરાતી (Gujarati)",
             "pa-IN": "ਪੰਜਾਬੀ (Punjabi)",
@@ -263,8 +261,7 @@ def main():
                     
                     # Agent Conversation Step
                     try:
-                        agent_res: AgentResult = safe_gemini_call(
-                            process_conversation,
+                        agent_res: AgentResult = process_conversation(
                             st.session_state.state,
                             transcript
                         )
