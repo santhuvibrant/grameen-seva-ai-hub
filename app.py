@@ -596,8 +596,24 @@ def format_inr(amount: int | float) -> str:
 
 
 def automatic_recording() -> bytes | None:
-    """Record one utterance and return it after browser-side silence detection."""
-    from streamlit_realtime_audio_recorder import audio_recorder
+    """Record one utterance and return it after browser-side silence detection.
+
+    The primary component returns a base64 payload. The fallback component
+    returns raw audio bytes and stops after a pause, so the cloud deployment
+    remains usable if the primary component is unavailable.
+    """
+    try:
+        from streamlit_realtime_audio_recorder import audio_recorder
+    except ModuleNotFoundError:
+        try:
+            from audio_recorder_streamlit import audio_recorder
+        except ModuleNotFoundError:
+            st.error(
+                "The microphone component is not installed. Redeploy after installing "
+                "the dependencies from requirements.txt."
+            )
+            return None
+        return audio_recorder(pause_threshold=1.5, sample_rate=16000) or None
 
     recording = audio_recorder(interval=50, threshold=-55, silenceTimeout=1500)
     if not recording or recording.get("status") != "stopped":
