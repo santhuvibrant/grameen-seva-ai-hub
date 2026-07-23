@@ -42,6 +42,7 @@ def init_state() -> None:
         "tts_token": 0,
         "last_played_tts_token": -1,
         "last_component_event_id": None,
+        "recorder_reset_token": 0,
         "last_audio_hash": "",
         "error_message": "",
         "form_data": {},
@@ -247,6 +248,8 @@ def render_form_assistant(conversation: ConversationState) -> None:
 def handle_recording(audio_bytes: bytes) -> bool:
     conversation: ConversationState = st.session_state.conversation
     st.session_state.error_message = ""
+    # Force the browser component out of its previous "processing" state.
+    st.session_state.recorder_reset_token += 1
     conversation.set_state("PROCESSING")
 
     with st.status("Processing your request…", expanded=True) as status:
@@ -423,6 +426,7 @@ audio = autonomous_recorder(
     tts_audio=None,
     tts_token=st.session_state.tts_token,
     resume_after_tts=False,
+    reset_token=st.session_state.recorder_reset_token,
 )
 
 # A component event is consumed once; this prevents duplicate STT/Gemini calls on reruns.
@@ -449,8 +453,9 @@ if audio_bytes:
     audio_hash = str(hash(audio_bytes))
     if audio_hash != st.session_state.last_audio_hash:
         st.session_state.last_audio_hash = audio_hash
-        if handle_recording(audio_bytes):
-            st.rerun()
+        handle_recording(audio_bytes)
+        # Re-render even when STT, Gemini, or TTS fails so the mic is usable again.
+        st.rerun()
 
 if st.session_state.tts_audio and st.session_state.last_played_tts_token != st.session_state.tts_token:
     st.audio(st.session_state.tts_audio, format="audio/wav", autoplay=True)

@@ -59,6 +59,7 @@
     let recorder = null;
     let chunks = [];
     let state = "idle"; // "idle", "recording", "processing", "disabled"
+    let lastResetToken = null;
 
     function send(value) {
       window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:setComponentValue", value}, "*");
@@ -164,6 +165,12 @@
     function render(newArgs) {
       args = newArgs || {};
       setHeight();
+      if (lastResetToken !== null && args.reset_token !== lastResetToken) {
+        stopTracks();
+        chunks = [];
+        setUIState("idle");
+      }
+      lastResetToken = args.reset_token;
       if (!args.active) {
         stopTracks();
         setUIState("disabled");

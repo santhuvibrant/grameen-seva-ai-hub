@@ -23,6 +23,7 @@ def autonomous_recorder(
     tts_audio: bytes | None,
     tts_token: int,
     resume_after_tts: bool,
+    reset_token: int,
 ) -> dict[str, Any] | None:
     """Return a completed utterance or a one-time recorder event."""
     audio = base64.b64encode(tts_audio).decode("ascii") if tts_audio else ""
@@ -32,6 +33,7 @@ def autonomous_recorder(
         tts_audio=audio,
         tts_token=tts_token,
         resume_after_tts=resume_after_tts,
+        reset_token=reset_token,
         key="autonomous-recorder",
         default=None,
     )
