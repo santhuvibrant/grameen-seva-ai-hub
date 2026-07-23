@@ -60,6 +60,11 @@ TAVILY_API_KEY = "your-key"
 FIRECRAWL_API_KEY = "your-key"
 # Optional — QR code target URL for science fair kiosk
 DEPLOY_URL = "https://your-app.streamlit.app"
+# Optional — required only to send approved claim emails
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = "587"
+SMTP_USERNAME = "your-sender@gmail.com"
+SMTP_PASSWORD = "your-gmail-app-password"
 ```
 
 ### 3. Run locally

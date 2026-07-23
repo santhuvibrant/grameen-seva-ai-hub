@@ -18,7 +18,7 @@ from services.research import get_scheme_details, search_schemes
 
 # Use Google's stable alias instead of a dated model ID. Dated IDs can return
 # 404 for newly created API keys even when the model appears in model listings.
-GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 MAX_GEMINI_RETRIES = 3
 
 

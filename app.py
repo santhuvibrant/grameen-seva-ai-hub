@@ -6,6 +6,8 @@ import base64
 import html
 import json
 import re
+import smtplib
+from email.message import EmailMessage
 
 import streamlit as st
 from google.genai import types
@@ -44,7 +46,11 @@ def init_state() -> None:
         "error_message": "",
         "form_data": {},
         "form_image_hash": "",
+        "form_image_bytes": None,
+        "form_image_type": "image/jpeg",
         "email_draft": "",
+        "claim_intent": "undecided",
+        "email_sent": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -144,6 +150,26 @@ Conversation details: {json.dumps({
     return (response.text or "").strip()
 
 
+def send_claim_email(body: str, image_bytes: bytes | None, image_type: str) -> None:
+    """Send only after the farmer explicitly clicks the send button."""
+    username = secret("SMTP_USERNAME")
+    password = secret("SMTP_PASSWORD")
+    if not username or not password:
+        raise RuntimeError("SMTP_USERNAME and SMTP_PASSWORD are missing from Streamlit secrets")
+    message = EmailMessage()
+    message["From"] = username
+    message["To"] = "santhu.vibrant@gmail.com"
+    message["Subject"] = "Request for help claiming an agricultural subsidy"
+    message.set_content(body)
+    if image_bytes:
+        maintype, subtype = (image_type or "image/jpeg").split("/", 1)
+        message.add_attachment(image_bytes, maintype=maintype, subtype=subtype, filename="subsidy_form.jpg")
+    with smtplib.SMTP(secret("SMTP_HOST") or "smtp.gmail.com", int(secret("SMTP_PORT") or "587")) as server:
+        server.starttls()
+        server.login(username, password)
+        server.send_message(message)
+
+
 def render_form_assistant(conversation: ConversationState) -> None:
     st.markdown("### Scan a subsidy form")
     st.caption("Take a clear photo of a printed form. Review every extracted detail before using it.")
@@ -155,8 +181,11 @@ def render_form_assistant(conversation: ConversationState) -> None:
         image_hash = str(hash(image.getvalue()))
         if image_hash != st.session_state.form_image_hash:
             st.session_state.form_image_hash = image_hash
+            st.session_state.form_image_bytes = image.getvalue()
+            st.session_state.form_image_type = image.type or "image/jpeg"
             st.session_state.form_data = {}
             st.session_state.email_draft = ""
+            st.session_state.email_sent = False
         if st.button("Read form", key="read_form", use_container_width=True):
             try:
                 with st.spinner("Reading the form…"):
@@ -193,6 +222,19 @@ def render_form_assistant(conversation: ConversationState) -> None:
     if st.session_state.email_draft:
         st.markdown("#### Email draft — review before sending")
         st.text_area("Draft", value=st.session_state.email_draft, height=300, key="email_preview")
+        if st.button("Send claim request to santhu.vibrant@gmail.com", key="send_claim_email", use_container_width=True):
+            try:
+                with st.spinner("Sending the claim request…"):
+                    send_claim_email(
+                        st.session_state.get("email_preview", st.session_state.email_draft),
+                        st.session_state.form_image_bytes,
+                        st.session_state.form_image_type,
+                    )
+                st.session_state.email_sent = True
+            except Exception as exc:
+                st.error(f"Email was not sent: {exc}")
+        if st.session_state.email_sent:
+            st.success("The claim request was sent to the test government mailbox.")
         st.download_button(
             "Download draft",
             data=st.session_state.email_draft,
@@ -304,6 +346,17 @@ def render_result(conversation: ConversationState) -> None:
         st.markdown("\n".join(f"- {html.escape(item)}" for item in result.required_documents))
     if result.source_url:
         st.link_button("Open official source", result.source_url, use_container_width=True)
+    st.markdown("### Would you like help claiming this subsidy?")
+    st.caption("I can read your form, prepare a request, and send it to the test mailbox only after you approve it.")
+    claim_cols = st.columns(2)
+    with claim_cols[0]:
+        if st.button("Yes, help me claim", key="claim_yes", use_container_width=True):
+            st.session_state.claim_intent = "yes"
+            st.rerun()
+    with claim_cols[1]:
+        if st.button("No, not now", key="claim_no", use_container_width=True):
+            st.session_state.claim_intent = "no"
+            st.rerun()
 
 
 def render_styles() -> None:
@@ -345,7 +398,10 @@ if conversation.language_code:
 render_chat(conversation)
 render_result(conversation)
 
-with st.expander("📄 Scan a form and draft a claim email", expanded=False):
+with st.expander(
+    "📄 Scan a form and send a claim request",
+    expanded=st.session_state.claim_intent == "yes",
+):
     render_form_assistant(conversation)
 
 if st.session_state.error_message:
